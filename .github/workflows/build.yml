@@ -1,0 +1,42 @@
+name: Build Dashboard Data
+
+on:
+  # 22:00 UTC, Mon-Fri = 6pm EDT / 5pm EST, always after the US close.
+  # GitHub only understands UTC here — a "timezone:" key is ignored.
+  schedule:
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build data
+        run: python scripts/build_data.py --out-dir data --csv-url "$CSV_URL"
+        env:
+          CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_stocks.csv
+          INDUSTRIES_CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_industries.csv
+
+      - name: Commit and push data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "refresh data"
+          git pull --rebase origin main
+          git push
