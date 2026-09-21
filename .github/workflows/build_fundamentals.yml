@@ -1,0 +1,46 @@
+name: Build Fundamentals Data
+
+on:
+  # 23:00 UTC Friday = 7pm EDT / 6pm EST. Runs after the Friday data build.
+  schedule:
+    - cron: '0 23 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # ~50 min for a full universe; fail rather than hang
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build fundamentals data
+        run: python scripts/fetch_fundamentals.py --snapshot-path data/snapshot.json --out-dir data
+
+      # Second pass: merges the new fundamentals.json into snapshot.json
+      - name: Merge fundamentals into snapshot
+        run: python scripts/build_data.py --out-dir data --csv-url "$CSV_URL"
+        env:
+          CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_stocks.csv
+          INDUSTRIES_CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_industries.csv
+
+      - name: Commit and push fundamentals
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "refresh fundamentals and snapshot"
+          git pull --rebase origin main
+          git push
