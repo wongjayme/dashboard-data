@@ -1,14 +1,22 @@
 name: Build Dashboard Data
 
 on:
-  # 22:00 UTC, Mon-Fri = 6pm EDT / 5pm EST, always after the US close.
-  # GitHub only understands UTC here — a "timezone:" key is ignored.
+  # Poll every 10 minutes through the evening window, Tue-Sat UTC (= Mon-Fri
+  # trading days). 01:40 UTC is 9:40pm EDT; 02:40 UTC is 9:40pm EST — so the
+  # window covers Fred's usual publish time in both halves of the year, with a
+  # long tail in case he's late. A run where nothing changed exits in ~20s.
   schedule:
-    - cron: '0 22 * * 1-5'
+    - cron: '40,50 1 * * 2-6'
+    - cron: '*/10 2-5 * * 2-6'
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Never let two runs push at the same time
+concurrency:
+  group: build-data
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -16,23 +24,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cheap gate: download Fred's two CSVs, fingerprint them, compare with
+      # the fingerprint saved by the last successful build.
+      - name: Check whether the RS data has changed
+        id: check
+        env:
+          CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_stocks.csv
+          INDUSTRIES_CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_industries.csv
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          curl -fsSL "$CSV_URL"            -o source/rs_stocks.csv
+          curl -fsSL "$INDUSTRIES_CSV_URL" -o source/rs_industries.csv
+          NEW=$(cat source/rs_stocks.csv source/rs_industries.csv | sha256sum | cut -d' ' -f1)
+          OLD=$(cat data/.source-stamp 2>/dev/null || echo none)
+          echo "stamp=$NEW" >> "$GITHUB_OUTPUT"
+          if [ "$NEW" = "$OLD" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Source unchanged since the last build - skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New source data - building."
+          fi
+
       - name: Set up Python
+        if: steps.check.outputs.changed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
+        if: steps.check.outputs.changed == 'true'
         run: pip install -r requirements.txt
 
+      # Build from the exact files that were fingerprinted above, not a fresh
+      # download, so the stamp can never describe a different version.
       - name: Build data
-        run: python scripts/build_data.py --out-dir data --csv-url "$CSV_URL"
+        if: steps.check.outputs.changed == 'true'
+        run: python scripts/build_data.py --out-dir data --csv-url source/rs_stocks.csv
         env:
-          CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_stocks.csv
-          INDUSTRIES_CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_industries.csv
+          INDUSTRIES_CSV_URL: source/rs_industries.csv
 
       - name: Commit and push data
+        if: steps.check.outputs.changed == 'true'
         run: |
+          echo "${{ steps.check.outputs.stamp }}" > data/.source-stamp
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
