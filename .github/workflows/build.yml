@@ -1,13 +1,12 @@
 name: Build Dashboard Data
 
 on:
-  # Poll every 10 minutes through the evening window, Tue-Sat UTC (= Mon-Fri
-  # trading days). 01:40 UTC is 9:40pm EDT; 02:40 UTC is 9:40pm EST — so the
-  # window covers Fred's usual publish time in both halves of the year, with a
-  # long tail in case he's late. A run where nothing changed exits in ~20s.
+  # Backstop only: one run a night. GitHub drops most frequent schedules and
+  # delivers the rest hours late, so the desktop app starts builds itself the
+  # moment new rankings appear; this is just a safety net for nights the app
+  # isn't opened. 04:00 UTC = 9pm PDT / 8pm PST, Tue-Sat UTC = Mon-Fri trading.
   schedule:
-    - cron: '40,50 1 * * 2-6'
-    - cron: '*/10 2-5 * * 2-6'
+    - cron: '0 4 * * 2-6'
   workflow_dispatch:
 
 permissions:
