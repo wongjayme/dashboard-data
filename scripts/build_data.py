@@ -3,10 +3,12 @@ Build stock dashboard data for static GitHub Pages deployment.
 
 Flow:
   1. Download fresh stock universe CSV (RS-ranked list)
-  2. Filter to AvgVol10 >= 100k
-  3. Batch-download 1y price history from yfinance in parallel
-  4. Compute metrics per stock
-  5. Write data/snapshot.json + data/meta.json
+  2. Filter the universe on AvgVol50, MarketCap and ETFs (see the MIN_* constants
+     below); add supplemental tickers and apply industry overrides
+  3. Batch-download 14 months of daily price history from yfinance in parallel
+  4. Compute metrics per stock (stale/halted tickers and closes below MIN_PRICE
+     are dropped; cached fundamentals.json is merged in if present)
+  5. Write data/snapshot.json + data/industries.json
 
 Run from repo root:
   python scripts/build_data.py [--out-dir data] [--csv-url URL] [--workers 10]
@@ -517,17 +519,10 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             hist["Low"].iloc[-2]  > hist["Low"].iloc[-3]
         ) if len(hist) >= 3 else False
 
-        # Bullish outside day: today's high > prev high AND today's low < prev low
-        bullish_outside = bool(
+        # Outside day: today's high > prev high AND today's low < prev low (engulfs prior range)
+        outside_day = bool(
             hist["High"].iloc[-1] > hist["High"].iloc[-2] and
             hist["Low"].iloc[-1]  < hist["Low"].iloc[-2]
-        ) if len(hist) >= 2 else False
-
-        # Bearish outside day: outside day (engulfs prev range) AND closes below prev close
-        bearish_outside = bool(
-            hist["High"].iloc[-1] > hist["High"].iloc[-2] and
-            hist["Low"].iloc[-1]  < hist["Low"].iloc[-2] and
-            hist["Close"].iloc[-1] < hist["Close"].iloc[-2]
         ) if len(hist) >= 2 else False
 
         # Hammer / Bullish Hammer
@@ -548,10 +543,13 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
         # Pocket Pivot: today closes up AND today's volume > max down-volume of prior 10 days
         pocket_pivot = False
         try:
-            if len(hist) >= 11:
+            if len(hist) >= 12:   # 11 prior bars needed so the oldest of the 10 days has a bar before it
                 today_vol  = hist["Volume"].iloc[-1]
+                # Flag down days on the FULL history, then take the last 10. Shifting inside the
+                # 10-row slice left its oldest day with no prior close, so it could never count as down.
+                is_down    = (hist["Close"] < hist["Close"].shift(1)).values
                 prior_10   = hist.iloc[-11:-1]
-                down_days  = prior_10[prior_10["Close"] < prior_10["Close"].shift(1)]
+                down_days  = prior_10[is_down[-11:-1]]
                 max_down_vol = down_days["Volume"].max() if len(down_days) > 0 else 0
                 pocket_pivot = bool(
                     _c > _prev_close and
@@ -584,7 +582,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
         def detect_patterns(h: pd.DataFrame) -> dict:
             """Run all pattern checks on the last 2 bars of a resampled DataFrame."""
             out = {k: False for k in [
-                "inside_day", "double_inside_day", "bullish_outside", "bearish_outside", "hammer",
+                "inside_day", "double_inside_day", "outside_day", "hammer",
                 "bullish_reversal_bar", "upside_reversal",
                 "oops_reversal", "pocket_pivot",
             ]}
@@ -608,8 +606,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
                     hi < p_hi and lo > p_lo and
                     p_hi < h["High"].iloc[-3] and p_lo > h["Low"].iloc[-3]
                 )
-                out["bullish_outside"]= bool(hi > p_hi and lo < p_lo)
-                out["bearish_outside"]= bool(hi > p_hi and lo < p_lo and c < p_close)
+                out["outside_day"]    = bool(hi > p_hi and lo < p_lo)
                 out["hammer"]         = bool(
                     candle_range > 0 and body <= 0.3 * candle_range and
                     lower_shadow >= 2 * body and upper_shadow <= 0.1 * candle_range
@@ -620,10 +617,11 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
                 )
                 out["oops_reversal"]  = bool(o < p_lo and c > p_lo)
                 # Pocket pivot on weekly/monthly: close up AND volume > max down-bar vol of prior 10 bars
-                if len(h) >= 11:
+                if len(h) >= 12:   # 11 prior bars needed (see daily pocket pivot note)
                     today_vol2  = h["Volume"].iloc[-1]
+                    is_down_bar = (h["Close"] < h["Close"].shift(1)).values
                     prior_10_2  = h.iloc[-11:-1]
-                    down_bars   = prior_10_2[prior_10_2["Close"] < prior_10_2["Close"].shift(1)]
+                    down_bars   = prior_10_2[is_down_bar[-11:-1]]
                     max_dv      = down_bars["Volume"].max() if len(down_bars) > 0 else 0
                     out["pocket_pivot"] = bool(c > p_close and today_vol2 > max_dv)
             except Exception:
@@ -683,8 +681,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             "price":      round(float(current), 2),
             "inside_day": inside_day,
             "double_inside_day": double_inside_day,
-            "bullish_outside": bullish_outside,
-            "bearish_outside": bearish_outside,
+            "outside_day": outside_day,
             "hammer":              hammer,
             "bullish_reversal_bar": bullish_reversal_bar,
             "upside_reversal":      upside_reversal,
@@ -693,8 +690,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             # Weekly patterns
             "inside_day_w":          weekly_patterns["inside_day"],
             "double_inside_day_w":   weekly_patterns["double_inside_day"],
-            "bullish_outside_w":     weekly_patterns["bullish_outside"],
-            "bearish_outside_w":     weekly_patterns["bearish_outside"],
+            "outside_day_w":         weekly_patterns["outside_day"],
             "hammer_w":              weekly_patterns["hammer"],
             "bullish_reversal_bar_w":weekly_patterns["bullish_reversal_bar"],
             "upside_reversal_w":     weekly_patterns["upside_reversal"],
@@ -703,8 +699,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             # Monthly patterns
             "inside_day_m":          monthly_patterns["inside_day"],
             "double_inside_day_m":   monthly_patterns["double_inside_day"],
-            "bullish_outside_m":     monthly_patterns["bullish_outside"],
-            "bearish_outside_m":     monthly_patterns["bearish_outside"],
+            "outside_day_m":         monthly_patterns["outside_day"],
             "hammer_m":              monthly_patterns["hammer"],
             "bullish_reversal_bar_m":monthly_patterns["bullish_reversal_bar"],
             "upside_reversal_m":     monthly_patterns["upside_reversal"],
