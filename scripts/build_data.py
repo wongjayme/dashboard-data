@@ -55,12 +55,33 @@ STALE_MAX_CALENDAR_DAYS = 4
 HV1_WINDOW        = 252   # prior sessions a bar must out-volume (strictly greater than the max)
 HV1_LOOKBACK_BARS = 10    # hv1_age is null if the last print is older than this (ages 0..9)
 
+# New 1M / 3M / 6M highs - trading-day windows. A flag needs the FULL window of prior bars, so a
+# recent IPO with a short history can never light up. Ties count (>=), matching new_52wk_high.
+NEW_HIGH_WINDOWS = {"1m": 21, "3m": 63, "6m": 126}
+
 # Industry trend sparkline — trailing window + sample count
 SPARK_WINDOW = 63   # trading days ≈ 3 months, matches the existing `3m` field
 SPARK_POINTS = 13   # evenly-spaced samples across the window (~weekly cadence)
 
+# Industry ranking: stop one outlier stock from skewing an industry's average.
+# Before an industry's vs-SPY returns (1M / 3M / 6M / 12M) are averaged, each stock's value is "soft capped" at
+# these universe-wide percentiles of that same field: up to the cutoff a stock counts in full; past it, each extra
+# point counts for only INDUSTRY_CLIP_CREDIT of a point (same on the downside, below the floor). So a stock up
+# +370% still counts for more than one up +45%, but cannot take over the industry's average.
+# The stock's own row is NOT changed; only its contribution to the industry average is limited.
+# The capped averages feed the industry rank blend and the rs_1m / rs_3m / rs_6m columns. The raw avg_vs_spy*
+# fields are still written, unchanged. (low, high) percentiles; set INDUSTRY_CLIP_PCT to None to turn it off.
+# CREDIT: 0 = hard cap (nothing counts past the cutoff), 1 = no cap at all.
+INDUSTRY_CLIP_PCT    = (5, 95)
+INDUSTRY_CLIP_CREDIT = 0.15
+INDUSTRY_CLIP_MIN_N  = 50    # a field needs at least this many stocks before its cutoffs are trusted (else no capping for it)
+
 # Ticker suffixes that indicate ETFs/funds — drop these
 ETF_SUFFIXES = ()  # yfinance universe shouldn't have ETFs, but just in case
+
+# Industries removed from the universe entirely (lower-case; matched against each ticker's FINAL industry,
+# i.e. its industry_overrides.csv value if it has one, otherwise the CSV's Industry)
+EXCLUDED_INDUSTRIES = {"shell companies"}
 
 # Columns to pass through from CSV into snapshot as-is (if present)
 CSV_PASSTHROUGH = [
@@ -543,6 +564,26 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             _upper_shadow <= 0.1 * _candle_range
         )
 
+        # Doji (long-legged cross): small body, centered, balanced wicks, on a normal-sized bar. All must hold:
+        #   1. body <= 5% of the bar's range
+        #   2. both wicks > 0 AND shorter wick >= 0.60 x longer wick (centered; rejects gravestone / dragonfly)
+        #   3. range between 0.5x and 2x the average high-low range of the prior 10 bars
+        #      (rejects flat bars below the band and blowout bars above it)
+        # Needs 10 prior bars; with less history it returns False.
+        # NOTE: weekly/monthly version lives in detect_patterns() below -- keep both in sync.
+        _avg_prior_range = (
+            (hist["High"] - hist["Low"]).iloc[-11:-1].mean() if len(hist) >= 11 else None
+        )
+        doji = bool(
+            _avg_prior_range is not None and
+            _candle_range > 0 and
+            _body <= 0.05 * _candle_range and
+            _upper_shadow > 0 and
+            _lower_shadow > 0 and
+            min(_upper_shadow, _lower_shadow) >= 0.60 * max(_upper_shadow, _lower_shadow) and
+            0.5 * _avg_prior_range <= _candle_range <= 2.0 * _avg_prior_range
+        )
+
         _prev_low   = hist["Low"].iloc[-2]
         _prev_close = hist["Close"].iloc[-2]
 
@@ -570,11 +611,16 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             _c > _prev_close
         ) if len(hist) >= 2 else False
 
-        # Upside Reversal: undercuts prev low, closes in upper half of today's range
+        # Upside Reversal: opens inside prev range (no gap below prev low), undercuts prev low
+        # intraday, then closes back above prev low AND above its own open, in the top third of
+        # today's range. Mutually exclusive with Oops (which needs an open BELOW prev low).
         upside_reversal = bool(
             _candle_range > 0 and
+            _o >= _prev_low and
             _l < _prev_low and
-            _c >= (_l + _candle_range * 0.5)
+            _c > _prev_low and
+            _c > _o and
+            _c >= (_l + _candle_range * (2 / 3))
         ) if len(hist) >= 2 else False
 
         # Oops Reversal: opens below prev low, closes above prev low
@@ -588,7 +634,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
         def detect_patterns(h: pd.DataFrame) -> dict:
             """Run all pattern checks on the last 2 bars of a resampled DataFrame."""
             out = {k: False for k in [
-                "inside_day", "double_inside_day", "outside_day", "hammer",
+                "inside_day", "double_inside_day", "outside_day", "hammer", "doji",
                 "bullish_reversal_bar", "upside_reversal",
                 "oops_reversal", "pocket_pivot",
             ]}
@@ -617,9 +663,23 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
                     candle_range > 0 and body <= 0.3 * candle_range and
                     lower_shadow >= 2 * body and upper_shadow <= 0.1 * candle_range
                 )
+                # Long-legged cross doji -- same rule as the daily one above (keep in sync).
+                prior_rng = (h["High"] - h["Low"]).iloc[-11:-1].mean() if len(h) >= 11 else None
+                out["doji"]           = bool(
+                    prior_rng is not None and
+                    candle_range > 0 and
+                    body <= 0.05 * candle_range and
+                    upper_shadow > 0 and
+                    lower_shadow > 0 and
+                    min(upper_shadow, lower_shadow) >= 0.60 * max(upper_shadow, lower_shadow) and
+                    0.5 * prior_rng <= candle_range <= 2.0 * prior_rng
+                )
                 out["bullish_reversal_bar"] = bool(lo < p_lo and c > p_close)
                 out["upside_reversal"]      = bool(
-                    candle_range > 0 and lo < p_lo and c >= (lo + candle_range * 0.5)
+                    candle_range > 0 and
+                    o >= p_lo and lo < p_lo and
+                    c > p_lo and c > o and
+                    c >= (lo + candle_range * (2 / 3))
                 )
                 out["oops_reversal"]  = bool(o < p_lo and c > p_lo)
                 # Pocket pivot on weekly/monthly: close up AND volume > max down-bar vol of prior 10 bars
@@ -669,6 +729,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
         new_52wk_high = False
         new_52wk_low  = False
         pct_from_52wk_low = None
+        pct_from_52wk_high = None
         high_52wk_level = None
         low_52wk_level  = None
         try:
@@ -686,6 +747,23 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
                 low_52wk_level  = round(float(min(low_52w,  today_low)),  4)
                 if low_52w and low_52w > 0:
                     pct_from_52wk_low = round((current / low_52w - 1) * 100, 2)
+                # % from 52-week high, from our own history (same high as new_52wk_high, includes today's bar).
+                # Overrides the CSV feed's value, which can lag / use a different basis. Always <= 0.
+                if high_52wk_level and high_52wk_level > 0:
+                    pct_from_52wk_high = round((current / high_52wk_level - 1) * 100, 2)
+        except Exception:
+            pass
+
+        # New 1M / 3M / 6M highs - today's High vs the max High of the prior N sessions (excluding today).
+        # count() == N requires a full, gap-free window; short or gappy history leaves the flag False.
+        # Windows are nested (a new 6M high is always also a new 3M and 1M high).
+        new_nm_high = {k: False for k in NEW_HIGH_WINDOWS}
+        try:
+            today_high_nm = hist["High"].iloc[-1]
+            for _k, _n in NEW_HIGH_WINDOWS.items():
+                prior_nm = hist["High"].iloc[-(_n + 1):-1]
+                if prior_nm.count() == _n:
+                    new_nm_high[_k] = bool(today_high_nm >= prior_nm.max())
         except Exception:
             pass
 
@@ -711,6 +789,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             "double_inside_day": double_inside_day,
             "outside_day": outside_day,
             "hammer":              hammer,
+            "doji":                doji,
             "bullish_reversal_bar": bullish_reversal_bar,
             "upside_reversal":      upside_reversal,
             "oops_reversal":        oops_reversal,
@@ -720,6 +799,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             "double_inside_day_w":   weekly_patterns["double_inside_day"],
             "outside_day_w":         weekly_patterns["outside_day"],
             "hammer_w":              weekly_patterns["hammer"],
+            "doji_w":                weekly_patterns["doji"],
             "bullish_reversal_bar_w":weekly_patterns["bullish_reversal_bar"],
             "upside_reversal_w":     weekly_patterns["upside_reversal"],
             "oops_reversal_w":       weekly_patterns["oops_reversal"],
@@ -729,15 +809,20 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             "double_inside_day_m":   monthly_patterns["double_inside_day"],
             "outside_day_m":         monthly_patterns["outside_day"],
             "hammer_m":              monthly_patterns["hammer"],
+            "doji_m":                monthly_patterns["doji"],
             "bullish_reversal_bar_m":monthly_patterns["bullish_reversal_bar"],
             "upside_reversal_m":     monthly_patterns["upside_reversal"],
             "oops_reversal_m":       monthly_patterns["oops_reversal"],
             "pocket_pivot_m":        monthly_patterns["pocket_pivot"],
             "new_52wk_high":        new_52wk_high,
             "new_52wk_low":         new_52wk_low,
+            "new_1m_high":          new_nm_high["1m"],
+            "new_3m_high":          new_nm_high["3m"],
+            "new_6m_high":          new_nm_high["6m"],
             "high_52wk":            high_52wk_level,
             "low_52wk":             low_52wk_level,
             "PctFrom52WkLow":       pct_from_52wk_low,
+            "PctFrom52WkHigh":      pct_from_52wk_high,
             "daily":      round(daily, 2),
             "1w":         round(one_week, 2)    if one_week    is not None else None,
             "1m":         round(one_month, 2)   if one_month   is not None else None,
@@ -800,7 +885,7 @@ def fetch_history_batch(tickers: list[str], max_workers: int = 10) -> dict[str, 
                 period="14mo",
                 interval="1d",
                 group_by="ticker",
-                auto_adjust=True,
+                auto_adjust=False,
                 progress=False,
                 threads=True,
             )
@@ -824,7 +909,7 @@ def fetch_history_batch(tickers: list[str], max_workers: int = 10) -> dict[str, 
             print(f"batch failed ({e}), falling back to per-ticker...")
             def _fetch_one(t: str):
                 try:
-                    df = yf.Ticker(t).history(period="14mo")
+                    df = yf.Ticker(t).history(period="14mo", auto_adjust=False)
                     return t, df if len(df) >= 2 else None
                 except Exception:
                     return t, None
@@ -912,6 +997,17 @@ def main():
         else:
             print("Supplemental tickers: all already present in CSV")
 
+    # Drop excluded industries entirely (uses the override industry when a ticker has one). Runs after the
+    # supplemental injection so supplemental tickers are covered, and before price histories are fetched.
+    if EXCLUDED_INDUSTRIES and len(universe):
+        def _final_industry(row):
+            ov = INDUSTRY_OVERRIDES.get(str(row["Ticker"]).strip())
+            return str(ov["industry"] if ov else row["Industry"]).strip().lower()
+        excl_mask = universe.apply(_final_industry, axis=1).isin(EXCLUDED_INDUSTRIES)
+        if excl_mask.any():
+            print(f"Excluded industries {sorted(EXCLUDED_INDUSTRIES)}: removed {int(excl_mask.sum())} tickers")
+            universe = universe[~excl_mask].reset_index(drop=True)
+
     tickers  = universe["Ticker"].tolist()
     print(f"Universe after filters: {len(tickers)} stocks\n")
 
@@ -998,6 +1094,10 @@ def main():
             **passthrough,
             **metrics,
         }
+        # PctFrom52WkHigh: our own calculation wins; use the CSV feed value only if we couldn't calculate one
+        # (e.g. not enough history), so a None from metrics never wipes out the feed value.
+        if row.get("PctFrom52WkHigh") is None and passthrough.get("PctFrom52WkHigh") is not None:
+            row["PctFrom52WkHigh"] = passthrough["PctFrom52WkHigh"]
 
         # Merge fundamental fields if available
         fund = fundamentals_cache.get(ticker)
@@ -1171,6 +1271,44 @@ def main():
             out.append(round(sum(vals) / len(vals), 2) if vals else None)
         return out
 
+    # Universe-wide clip cutoffs (see INDUSTRY_CLIP_PCT): one (low, high) pair per vs-SPY field, taken over every
+    # stock that survived the filters. Per field because 12M returns are spread far wider than 1M ones.
+    CLIP_KEYS = ("vs_spy", "vs_spy_3m", "vs_spy_6m", "vs_spy_12m")
+
+    def _finite(v):
+        return v is not None and bool(np.isfinite(v))
+
+    clip_bounds: dict[str, tuple[float, float]] = {}
+    if INDUSTRY_CLIP_PCT:
+        _clip_universe = [r for rows in by_industry.values() for r in rows]
+        for _k in CLIP_KEYS:
+            _vals = [r[_k] for r in _clip_universe if _finite(r.get(_k))]
+            if len(_vals) >= INDUSTRY_CLIP_MIN_N:
+                clip_bounds[_k] = (float(np.percentile(_vals, INDUSTRY_CLIP_PCT[0])),
+                                   float(np.percentile(_vals, INDUSTRY_CLIP_PCT[1])))
+        if clip_bounds:
+            print("Industry clip cutoffs (p%s / p%s of all stocks): " % INDUSTRY_CLIP_PCT +
+                  ", ".join(f"{k} [{lo:+.1f}, {hi:+.1f}]" for k, (lo, hi) in clip_bounds.items()))
+
+    def soft_cap(v, b):
+        """Full credit between the cutoffs; past either one, only INDUSTRY_CLIP_CREDIT of the extra counts."""
+        lo, hi = b
+        if v > hi:
+            return hi + INDUSTRY_CLIP_CREDIT * (v - hi)
+        if v < lo:
+            return lo + INDUSTRY_CLIP_CREDIT * (v - lo)
+        return v
+
+    def avg_clipped(rows, key):
+        """Like avg(), but each stock's value is first soft-capped at the universe cutoffs for that field."""
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        if not vals:
+            return None
+        b = clip_bounds.get(key)
+        if b:
+            vals = [soft_cap(v, b) for v in vals]
+        return round(sum(vals) / len(vals), 2)
+
     industry_summary = {
         industry: {
             "sector":          industry_to_sector[industry],
@@ -1187,7 +1325,12 @@ def main():
             "avg_1y":           avg(rows, "1y"),
             "avg_vs_spy_6m":   avg(rows, "vs_spy_6m"),
             "avg_vs_spy_12m":  avg(rows, "vs_spy_12m"),
-            "avg_dist_ma50":   avg_dist_ma50(rows),
+            # clipped versions (outlier-limited): these drive the rank blend and rs_1m / rs_3m / rs_6m
+            "avg_vs_spy_clip":      avg_clipped(rows, "vs_spy"),
+            "avg_vs_spy_3m_clip":   avg_clipped(rows, "vs_spy_3m"),
+            "avg_vs_spy_6m_clip":   avg_clipped(rows, "vs_spy_6m"),
+            "avg_vs_spy_12m_clip":  avg_clipped(rows, "vs_spy_12m"),
+            "avg_dist_ma50":  avg_dist_ma50(rows),
             "pct_confirmed_uptrend": pct_confirmed_uptrend(rows),
             "pct_above_50sma":       pct_above_dist_ma(rows, "SMA50"),
             "pct_above_21ema":       pct_above_dist_ma(rows, "EMA21"),
@@ -1217,9 +1360,9 @@ def main():
     RS_THRESHOLDS_3M  = [(65.0,99),(40.0,95),(25.0,90),(13.0,80),(11.0,70),(7.0,60),(4.0,50),(0.0,40),(-3.0,30),(-6.0,20),(-11.0,10),(-20.0,1)]
     RS_THRESHOLDS_6M  = [(80.0,99),(55.0,95),(35.0,90),(20.0,80),(15.0,70),(10.0,60),(5.0,50),(0.0,40),(-5.0,30),(-10.0,20),(-18.0,10),(-30.0,1)]
     for ind, s in industry_summary.items():
-        s["rs_1m"]  = ind_rs_thresholds(s.get("avg_vs_spy"),     RS_THRESHOLDS_1M)
-        s["rs_3m"]  = ind_rs_thresholds(s.get("avg_vs_spy_3m"),  RS_THRESHOLDS_3M)
-        s["rs_6m"]  = ind_rs_thresholds(s.get("avg_vs_spy_6m"),  RS_THRESHOLDS_6M)
+        s["rs_1m"]  = ind_rs_thresholds(s.get("avg_vs_spy_clip"),    RS_THRESHOLDS_1M)
+        s["rs_3m"]  = ind_rs_thresholds(s.get("avg_vs_spy_3m_clip"), RS_THRESHOLDS_3M)
+        s["rs_6m"]  = ind_rs_thresholds(s.get("avg_vs_spy_6m_clip"), RS_THRESHOLDS_6M)
         raw_pct = industry_rs_map.get(ind)
         s["rs_12m"] = int(round(raw_pct)) if raw_pct is not None else None
 
@@ -1249,10 +1392,10 @@ def main():
     # 9. Build industries list with self-computed rank/percentile
     # Blend score: 50% 3m / 25% 1m / 15% 6m / 10% 12m vs SPX
     def blend_score(s):
-        v3  = s.get("avg_vs_spy_3m")
-        v1  = s.get("avg_vs_spy")
-        v6  = s.get("avg_vs_spy_6m")
-        v12 = s.get("avg_vs_spy_12m")
+        v3  = s.get("avg_vs_spy_3m_clip")
+        v1  = s.get("avg_vs_spy_clip")
+        v6  = s.get("avg_vs_spy_6m_clip")
+        v12 = s.get("avg_vs_spy_12m_clip")
         if v3 is None and v1 is None and v6 is None and v12 is None:
             return None
         return round(
@@ -1281,7 +1424,7 @@ def main():
             "blend_score": score,
         })
 
-    print(f"Computed ranks for {len(industries_list)} industries (50% 3M / 25% 1M / 15% 6M / 10% 12M vs SPX)")
+    print(f"Computed ranks for {len(industries_list)} industries (50% 3M / 25% 1M / 15% 6M / 10% 12M vs SPX, stock returns soft-capped at p{INDUSTRY_CLIP_PCT[0]}/p{INDUSTRY_CLIP_PCT[1]}, {INDUSTRY_CLIP_CREDIT:.0%} credit beyond)" if INDUSTRY_CLIP_PCT and clip_bounds else f"Computed ranks for {len(industries_list)} industries (50% 3M / 25% 1M / 15% 6M / 10% 12M vs SPX, no clipping)")
 
     def write_json(filename, obj):
         path = os.path.join(args.out_dir, filename)
