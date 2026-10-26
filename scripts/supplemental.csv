@@ -115,6 +115,7 @@ SIND,Basic Materials,Other Precious Metals & Mining
 SKHY,Technology,Semiconductors
 STDN,Basic Materials,Specialty Chemicals
 ADBT,Technology,Software - Application
+SPT,Technology,Software - Application
 ADIG,Technology,Computer Hardware
 APMD,Healthcare,Biotechnology
 ASBH,Financial,Banks - Regional
@@ -149,3 +150,11 @@ CHWM,Basic Materials,Other Industrial Metals & Mining
 PORT-U,Financial,Shell Companies
 RZAI,Industrials,Security & Protection Services
 VYLR,Basic Materials,Agricultural Inputs
+ADRX,Healthcare,Biotechnology
+AMRO,Basic Materials,Other Industrial Metals & Mining
+FJDI,Financial,Shell Companies
+FLSC,Financial,Shell Companies
+IAM,Healthcare,Biotechnology
+RTSN,Healthcare,Biotechnology
+SCAT,Financial,Shell Companies
+TRXB,Healthcare,Biotechnology
