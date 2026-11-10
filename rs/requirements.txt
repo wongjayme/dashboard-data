@@ -1,0 +1,10 @@
+requests>=2.31.0
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+PyYAML>=6.0
+yfinance>=0.2.54
+curl_cffi>=0.6.0
+lxml>=4.9.0
+python-dateutil>=2.8.0
+html5lib>=1.1
