@@ -1,6 +1,10 @@
 name: Build Dashboard Data
 
 on:
+  # Main trigger: runs as soon as our own RS log (rs_log.yml) finishes.
+  workflow_run:
+    workflows: ["Generate RS Log"]
+    types: [completed]
   # Backstop only: one run a night. GitHub drops most frequent schedules and
   # delivers the rest hours late, so the desktop app starts builds itself the
   # moment new rankings appear; this is just a safety net for nights the app
@@ -23,18 +27,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Cheap gate: download Fred's two CSVs, fingerprint them, compare with
-      # the fingerprint saved by the last successful build.
+      # Cheap gate: take our own two RS CSVs (rs/output, written by
+      # rs_log.yml), fingerprint them, compare with the fingerprint saved by
+      # the last successful build.
       - name: Check whether the RS data has changed
         id: check
-        env:
-          CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_stocks.csv
-          INDUSTRIES_CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_industries.csv
         run: |
           set -euo pipefail
           mkdir -p source
-          curl -fsSL "$CSV_URL"            -o source/rs_stocks.csv
-          curl -fsSL "$INDUSTRIES_CSV_URL" -o source/rs_industries.csv
+          cp rs/output/rs_stocks.csv     source/rs_stocks.csv
+          cp rs/output/rs_industries.csv source/rs_industries.csv
           NEW=$(cat source/rs_stocks.csv source/rs_industries.csv | sha256sum | cut -d' ' -f1)
           OLD=$(cat data/.source-stamp 2>/dev/null || echo none)
           echo "stamp=$NEW" >> "$GITHUB_OUTPUT"

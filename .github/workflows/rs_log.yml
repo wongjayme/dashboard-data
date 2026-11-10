@@ -1,0 +1,68 @@
+name: Generate RS Log
+
+# Our own copy of Fred6725/relative-strength's daily job (see rs/README.md).
+# When it finishes, build.yml picks up the new CSVs via workflow_run.
+
+on:
+  # 23:30 UTC Mon-Fri = 4:30pm PDT / 3:30pm PST, after the US close.
+  # GitHub can deliver scheduled runs late; "Run workflow" works any time.
+  schedule:
+    - cron: '30 23 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Shared with the weekly ticker_info refresh so they never commit at once
+concurrency:
+  group: rs-log
+  cancel-in-progress: false
+
+jobs:
+  generate-rs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: rs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: rs/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run relative strength calculation
+        run: python relative-strength.py true
+
+      # Refuse to publish a broken run (e.g. Yahoo blocked most downloads):
+      # the dashboard keeps the previous day's data instead.
+      - name: Sanity-check output
+        run: |
+          set -euo pipefail
+          ROWS=$(($(wc -l < output/rs_stocks.csv) - 1))
+          IND=$(($(wc -l < output/rs_industries.csv) - 1))
+          echo "rs_stocks.csv: $ROWS stocks | rs_industries.csv: $IND industries"
+          if [ "$ROWS" -lt 4000 ] || [ "$IND" -lt 100 ]; then
+            echo "::error::Too few rows - not publishing this run"
+            exit 1
+          fi
+
+      - name: Commit and push RS log
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/ data_persist/ticker_info.json
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "RS Ratings update $(date -u +'%Y-%m-%d')"
+          git pull --rebase origin main
+          git push

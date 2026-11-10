@@ -32,8 +32,8 @@ jobs:
       - name: Merge fundamentals into snapshot
         run: python scripts/build_data.py --out-dir data --csv-url "$CSV_URL"
         env:
-          CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_stocks.csv
-          INDUSTRIES_CSV_URL: https://raw.githubusercontent.com/Fred6725/rs-log/refs/heads/main/output/rs_industries.csv
+          CSV_URL: rs/output/rs_stocks.csv
+          INDUSTRIES_CSV_URL: rs/output/rs_industries.csv
 
       - name: Commit and push fundamentals
         run: |

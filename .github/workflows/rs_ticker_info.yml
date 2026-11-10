@@ -1,0 +1,53 @@
+name: Refresh RS Ticker Info Weekly
+
+# Re-fetches sector / industry / market cap / float / short interest / revenue
+# growth for every ticker into rs/data_persist/ticker_info.json.
+# The daily RS run only fetches info for tickers it has never seen.
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Sunday 00:00 UTC (Saturday afternoon Pacific)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rs-log
+  cancel-in-progress: false
+
+jobs:
+  update-ticker-info:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # ~6,800 tickers x ~1.5s = ~3h expected
+    defaults:
+      run:
+        working-directory: rs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: rs/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Refresh ticker_info.json
+        run: python data_persist/update_stocks.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data_persist/ticker_info.json
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "Weekly ticker_info refresh $(date -u +'%Y-%m-%d')"
+          git pull --rebase origin main
+          git push
