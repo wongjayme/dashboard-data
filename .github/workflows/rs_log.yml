@@ -4,10 +4,17 @@ name: Generate RS Log
 # When it finishes, build.yml picks up the new CSVs via workflow_run.
 
 on:
-  # 23:30 UTC Mon-Fri = 4:30pm PDT / 3:30pm PST, after the US close.
-  # GitHub can deliver scheduled runs late; "Run workflow" works any time.
+  # Main run 21:37 UTC Mon-Fri = 1:37pm PST / 2:37pm PDT, after the US close
+  # (an off-peak minute, since GitHub delays runs most on the hour/half hour).
+  # Two backups in case GitHub drops or badly delays the main run; a backup
+  # exits in seconds if the RS log was already published in the last 5 hours.
+  #   22:57 UTC Mon-Fri      = 2:57pm PST / 3:57pm PDT
+  #   01:17 UTC Tue-Sat      = 5:17pm PST / 6:17pm PDT (previous day Pacific)
+  # "Run workflow" by hand always runs, regardless of the 5-hour check.
   schedule:
-    - cron: '30 23 * * 1-5'
+    - cron: '37 21 * * 1-5'
+    - cron: '57 22 * * 1-5'
+    - cron: '17 1 * * 2-6'
   workflow_dispatch:
 
 permissions:
@@ -28,8 +35,23 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      # Backup runs stop here if a run already published recently
+      - name: Skip if already published in the last 5 hours
+        id: guard
+        run: |
+          LAST=$(git log -1 --format=%ct -- output/rs_stocks.csv || echo 0)
+          AGE=$(( $(date +%s) - ${LAST:-0} ))
+          echo "Last RS publish was $((AGE / 60)) minutes ago"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$AGE" -lt 18000 ]; then
+            echo "Already published recently - skipping this run"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Python 3.11
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -37,16 +59,19 @@ jobs:
           cache-dependency-path: rs/requirements.txt
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run relative strength calculation
+        if: steps.guard.outputs.skip != 'true'
         run: python relative-strength.py true
 
       # Refuse to publish a broken run (e.g. Yahoo blocked most downloads):
       # the dashboard keeps the previous day's data instead.
       - name: Sanity-check output
+        if: steps.guard.outputs.skip != 'true'
         run: |
           set -euo pipefail
           ROWS=$(($(wc -l < output/rs_stocks.csv) - 1))
@@ -58,6 +83,7 @@ jobs:
           fi
 
       - name: Commit and push RS log
+        if: steps.guard.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
