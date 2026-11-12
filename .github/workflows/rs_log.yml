@@ -64,9 +64,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Same as `python relative-strength.py true` (download prices, then rank),
+      # split into two steps so fix_splits.py can run in between: on a split day
+      # Yahoo can serve unadjusted older prices for a few hours, which makes a
+      # reverse split look like a huge gain (SLXN/GOVX on 2026-11-11).
+      - name: Download price history
+        if: steps.guard.outputs.skip != 'true'
+        run: python -c "import rs_data; rs_data.main(False)"
+
+      - name: Repair splits Yahoo hasn't applied yet
+        if: steps.guard.outputs.skip != 'true'
+        run: python fix_splits.py
+
       - name: Run relative strength calculation
         if: steps.guard.outputs.skip != 'true'
-        run: python relative-strength.py true
+        run: python -c "import rs_ranking; rs_ranking.main(True)"
 
       # Refuse to publish a broken run (e.g. Yahoo blocked most downloads):
       # the dashboard keeps the previous day's data instead.
