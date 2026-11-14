@@ -4,16 +4,15 @@ name: Generate RS Log
 # When it finishes, build.yml picks up the new CSVs via workflow_run.
 
 on:
-  # Main run 21:37 UTC Mon-Fri = 1:37pm PST / 2:37pm PDT, after the US close
-  # (an off-peak minute, since GitHub delays runs most on the hour/half hour).
-  # Two backups in case GitHub drops or badly delays the main run; a backup
-  # exits in seconds if the RS log was already published in the last 5 hours.
-  #   22:57 UTC Mon-Fri      = 2:57pm PST / 3:57pm PDT
-  #   01:17 UTC Tue-Sat      = 5:17pm PST / 6:17pm PDT (previous day Pacific)
-  # "Run workflow" by hand always runs, regardless of the 5-hour check.
+  # The main run is started by cron-job.org at 6:37pm Eastern (3:37pm
+  # Pacific) Mon-Fri through "Run workflow" (workflow_dispatch), which GitHub
+  # never delays and which always does a full run.
+  # The schedule below is only a backup in case that run fails or never
+  # starts. It is set after the main run so it can never publish early data,
+  # and it exits in seconds if the RS log was published in the last 12 hours.
+  #   01:17 UTC Tue-Sat = 5:17pm PST / 6:17pm PDT (previous day Pacific)
+  # GitHub often starts scheduled runs hours late; the 12-hour check covers that.
   schedule:
-    - cron: '37 21 * * 1-5'
-    - cron: '57 22 * * 1-5'
     - cron: '17 1 * * 2-6'
   workflow_dispatch:
 
@@ -39,13 +38,13 @@ jobs:
           fetch-depth: 50
 
       # Backup runs stop here if a run already published recently
-      - name: Skip if already published in the last 5 hours
+      - name: Skip if already published in the last 12 hours
         id: guard
         run: |
           LAST=$(git log -1 --format=%ct -- output/rs_stocks.csv || echo 0)
           AGE=$(( $(date +%s) - ${LAST:-0} ))
           echo "Last RS publish was $((AGE / 60)) minutes ago"
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$AGE" -lt 18000 ]; then
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$AGE" -lt 43200 ]; then
             echo "Already published recently - skipping this run"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
