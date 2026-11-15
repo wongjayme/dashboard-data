@@ -55,6 +55,12 @@ STALE_MAX_CALENDAR_DAYS = 4
 HV1_WINDOW        = 252   # prior sessions a bar must out-volume (strictly greater than the max)
 HV1_LOOKBACK_BARS = 10    # hv1_age is null if the last print is older than this (ages 0..9)
 
+# RS line (stock close / ^GSPC close) new-high recency. Same 252-bar window, tie rule (>=) and 0..9 age scale as
+# new_52wk_high / hv1_age. RSNH_FFILL_LIMIT = max consecutive missing stock bars (vs the S&P calendar) that get filled.
+RSNH_WINDOW        = 252
+RSNH_LOOKBACK_BARS = 10
+RSNH_FFILL_LIMIT   = 2
+
 # New 1M / 3M / 6M highs - trading-day windows. A flag needs the FULL window of prior bars, so a
 # recent IPO with a short history can never light up. Ties count (>=), matching new_52wk_high.
 NEW_HIGH_WINDOWS = {"1m": 21, "3m": 63, "6m": 126}
@@ -308,6 +314,43 @@ def calculate_spark_series(close: pd.Series, window: int = SPARK_WINDOW, points:
         return None
 
 
+def _naive_date_index(idx) -> pd.DatetimeIndex:
+    """Tz-naive, midnight-normalised copy of a DatetimeIndex, so stock and ^GSPC bars match by calendar date
+    (yf.Ticker().history() is tz-aware, yf.download() batch results are tz-naive)."""
+    idx = pd.DatetimeIndex(idx)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    return idx.normalize()
+
+
+def calc_rs_high_age(close: pd.Series, spy_close: pd.Series) -> int | None:
+    """Sessions since the stock's RS line (stock close / ^GSPC close) last closed at a new 252-session high.
+    0 = the stock's last bar, None = no RS-line high in the last RSNH_LOOKBACK_BARS bars.
+
+    - Stock and ^GSPC are matched by DATE (reindex), never by position, and "today" is the stock's own last bar.
+    - A bar is a new high if its RS >= the max of the prior RSNH_WINDOW bars (ties count, like new_52wk_high).
+    - The full window is required (min_periods), so recent IPOs and gappy histories return None.
+    - Up to RSNH_FFILL_LIMIT consecutive missing stock bars are forward-filled so one feed gap doesn't null the
+      ticker; a filled bar only fills the lookback window and can never itself be the reported high.
+    """
+    stock = pd.Series(close.to_numpy(dtype=float), index=_naive_date_index(close.index))
+    spx   = pd.Series(spy_close.to_numpy(dtype=float), index=_naive_date_index(spy_close.index))
+    stock = stock[~stock.index.duplicated(keep="last")].dropna()
+    spx   = spx[~spx.index.duplicated(keep="last")].dropna()
+    if stock.empty or spx.empty:
+        return None
+    spx     = spx[spx.index <= stock.index[-1]]
+    aligned = stock.reindex(spx.index)
+    real    = aligned.notna().to_numpy()
+    rs      = aligned.ffill(limit=RSNH_FFILL_LIMIT) / spx
+    prior_max = rs.shift(1).rolling(RSNH_WINDOW, min_periods=RSNH_WINDOW).max()
+    is_high   = (rs >= prior_max).to_numpy() & real      # NaN comparisons evaluate to False
+    for age in range(min(RSNH_LOOKBACK_BARS, len(is_high))):
+        if is_high[-1 - age]:
+            return age
+    return None
+
+
 def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> dict | None:
     """Compute all price-derived metrics for a single ticker."""
     try:
@@ -328,9 +371,17 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
         three_month = (current / close.iloc[-63] - 1) * 100 if len(close) >= 63 else None
         spark_3m    = calculate_spark_series(close)
 
-        # YTD: first close of current calendar year
-        year_rows = hist[hist.index.year == hist.index[-1].year]
-        ytd = (current / year_rows["Close"].iloc[0] - 1) * 100 if len(year_rows) >= 1 else None
+        # YTD: vs the LAST close of the prior calendar year (standard definition). Using the first close of the
+        # current year would drop that first session's move. Falls back to the first close of the current year
+        # only when there are no prior-year bars (e.g. a stock that IPO'd this year).
+        _cur_year  = hist.index[-1].year
+        _prior_yr  = hist[hist.index.year < _cur_year]
+        if len(_prior_yr) >= 1:
+            ytd_base = _prior_yr["Close"].iloc[-1]
+        else:
+            _year_rows = hist[hist.index.year == _cur_year]
+            ytd_base   = _year_rows["Close"].iloc[0] if len(_year_rows) >= 1 else None
+        ytd = (current / ytd_base - 1) * 100 if ytd_base else None
 
         # vs SPY relative strength (1m, 3m, 6m, 12m)
         vs_spy_1m = vs_spy_3m = vs_spy_6m = vs_spy_12m = None
@@ -783,6 +834,15 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
         except Exception:
             pass
 
+        # RS line new-high recency (stock close / ^GSPC close at a new 252-session high) - see calc_rs_high_age.
+        # Null when ^GSPC is unavailable, history is short/gappy, or there is no RS high in the last 10 bars.
+        rs_high_age = None
+        try:
+            if spy_hist is not None:
+                rs_high_age = calc_rs_high_age(hist["Close"], spy_hist["Close"])
+        except Exception:
+            pass
+
         return {
             "price":      round(float(current), 2),
             "inside_day": inside_day,
@@ -843,6 +903,7 @@ def compute_metrics(ticker: str, hist: pd.DataFrame, spy_hist: pd.DataFrame) -> 
             "adr_pct":   adr_pct,
             "rel_vol":        rel_vol,
             "hv1_age":        hv1_age,
+            "rs_high_age":    rs_high_age,
             "ud_vol_ratio_20": ud_vol_ratio_20,
             "ud_vol_ratio_50": ud_vol_ratio_50,
             "dist_ma":   dist_ma,
