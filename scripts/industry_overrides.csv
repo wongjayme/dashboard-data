@@ -63,6 +63,8 @@ NET,Cyber Security,Technology
 RBRK,Cyber Security,Technology
 ATEN,Cyber Security,Technology
 RDWR,Cyber Security,Technology
+NTSK,Cyber Security,Technology
+TLS,Cyber Security,Technology
 BLSH,Crypto - Blockchain,Financial Services
 COIN,Crypto - Blockchain,Financial Services
 RKLB,Space,Industrials
@@ -80,6 +82,7 @@ FLY,Space,Industrials
 SIDU,Space,Industrials
 DQ,Solar,Technology
 KEEL,Data Center - Crypto Mining,Technology
+BGIN,Data Center - Crypto Mining,Technology
 PACB,Genomics & Gene Therapy,Healthcare
 TWST,Genomics & Gene Therapy,Healthcare
 TXG,Genomics & Gene Therapy,Healthcare
